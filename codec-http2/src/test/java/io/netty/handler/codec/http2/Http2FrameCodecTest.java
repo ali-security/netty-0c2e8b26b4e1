@@ -71,6 +71,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyLong;
@@ -312,6 +313,79 @@ public class Http2FrameCodecTest {
         assertEquals(expectedRst, actualRst);
 
         assertNull(inboundHandler.readInbound());
+    }
+
+    @Test
+    public void rapidResetFloodClosesConnectionByDefault() throws Exception {
+        // HTTP/2 Rapid Reset (CVE-2023-44487): the peer opens a stream and resets it immediately, over and over.
+        // Use the regular build path (no mocked frame writer) so the default decoder decorators are installed.
+        tearDown();
+        frameCodec = Http2FrameCodecBuilder.forServer().build();
+        inboundHandler = new LastInboundHandler();
+        channel = new EmbeddedChannel();
+        frameInboundWriter = new Http2FrameInboundWriter(channel);
+        channel.connect(new InetSocketAddress(0));
+        channel.pipeline().addLast(frameCodec);
+        channel.pipeline().addLast(inboundHandler);
+        channel.pipeline().fireChannelActive();
+        channel.writeInbound(Http2CodecUtil.connectionPrefaceBuf());
+        frameInboundWriter.writeInboundSettings(new Http2Settings());
+        frameInboundWriter.writeInboundSettingsAck();
+
+        int streamId = 1;
+        for (int i = 0; i < 200; i++, streamId += 2) {
+            frameInboundWriter.writeInboundHeaders(streamId, request, 0, false);
+            frameInboundWriter.writeInboundRstStream(streamId, Http2Error.CANCEL.code());
+        }
+        inboundHandler.checkException();
+        assertTrue(channel.isActive());
+
+        frameInboundWriter.writeInboundHeaders(streamId, request, 0, false);
+        frameInboundWriter.writeInboundRstStream(streamId, Http2Error.CANCEL.code());
+
+        try {
+            inboundHandler.checkException();
+            fail("Expected a connection error");
+        } catch (Http2Exception e) {
+            assertEquals(Http2Error.ENHANCE_YOUR_CALM, e.error());
+        }
+        assertFalse(channel.isActive());
+
+        // The connection must have been torn down with a GO_AWAY(ENHANCE_YOUR_CALM).
+        ByteBuf written = Unpooled.buffer();
+        for (;;) {
+            ByteBuf buf = channel.readOutbound();
+            if (buf == null) {
+                break;
+            }
+            written.writeBytes(buf);
+            buf.release();
+        }
+        long goAwayErrorCode = -1;
+        while (written.readableBytes() >= Http2CodecUtil.FRAME_HEADER_LENGTH) {
+            int payloadLength = written.readUnsignedMedium();
+            byte frameType = written.readByte();
+            written.skipBytes(5); // flags + stream identifier
+            if (frameType == Http2FrameTypes.GO_AWAY) {
+                written.skipBytes(4); // last stream identifier
+                goAwayErrorCode = written.readUnsignedInt();
+                written.skipBytes(payloadLength - 8);
+            } else {
+                written.skipBytes(payloadLength);
+            }
+        }
+        written.release();
+        assertEquals(Http2Error.ENHANCE_YOUR_CALM.code(), goAwayErrorCode);
+    }
+
+    @Test
+    public void maxRstFramesEnforcedByDefaultOnlyOnServer() {
+        assertTrue(Http2FrameCodecBuilder.forServer().build().decoder() instanceof Http2MaxRstFrameDecoder);
+        assertFalse(Http2FrameCodecBuilder.forClient().build().decoder() instanceof Http2MaxRstFrameDecoder);
+        assertFalse(Http2FrameCodecBuilder.forServer().decoderEnforceMaxRstFramesPerWindow(0, 0).build()
+                .decoder() instanceof Http2MaxRstFrameDecoder);
+        assertTrue(Http2FrameCodecBuilder.forClient().decoderEnforceMaxRstFramesPerWindow(10, 1).build()
+                .decoder() instanceof Http2MaxRstFrameDecoder);
     }
 
     @Test
