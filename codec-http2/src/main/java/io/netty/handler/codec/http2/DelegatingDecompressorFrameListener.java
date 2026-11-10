@@ -25,6 +25,7 @@ import io.netty.handler.codec.compression.BrotliDecoder;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
 import io.netty.handler.codec.compression.ZlibWrapper;
 import io.netty.handler.codec.compression.SnappyFrameDecoder;
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.UnstableApi;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
@@ -312,8 +313,15 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
                     // Immediately return the bytes back to the flow controller. ConsumedBytesConverter will convert
                     // from the decompressed amount which the user knows about to the compressed amount which flow
                     // control knows about.
-                    connection.local().flowController().consumeBytes(stream,
-                            listener.onDataRead(targetCtx, stream.id(), buf, padding, false));
+                    try {
+                        connection.local().flowController().consumeBytes(stream,
+                                listener.onDataRead(targetCtx, stream.id(), buf, padding, false));
+                    } catch (Throwable cause) {
+                        // CVE-2026-48043: release the decompressed buffer if delegating the read fails,
+                        // otherwise it leaks.
+                        buf.release();
+                        PlatformDependent.throwException(cause);
+                    }
                     padding = 0; // Padding is only communicated once on the first iteration.
                     buf.release();
 
